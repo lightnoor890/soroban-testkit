@@ -41,3 +41,12 @@ a committed ceiling.
 
 The generated third-party property asserts that unauthorized addresses cannot
 claim escrowed funds. Timeout tests advance the ledger clock instead of waiting.
+
+`create_milestones` accepts a vector of positive tranche amounts and locks their
+sum up front. Every tranche collects a fresh quorum; the escrow stays in the
+submitted state between payments. The seller receives only the tranche whose
+quorum completed, and a timeout or arbiter refund returns the unpaid remainder.
+
+For a milestone schedule, the buyer supplies the seller address when creating
+the escrow. Other addresses cannot submit work or approve releases for that
+schedule; generated tests check this even when amounts vary.

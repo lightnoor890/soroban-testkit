@@ -35,6 +35,12 @@ pub struct Bounty {
     pub token: Address,
     /// How much of `token` is locked.
     pub amount: i128,
+    /// Seller permitted to submit this milestone escrow.
+    pub seller: Option<Address>,
+    /// Payment tranches released one at a time after the review quorum.
+    pub milestones: Vec<i128>,
+    /// Number of milestones already paid.
+    pub milestones_paid: u32,
     /// Who submitted work, once somebody has.
     pub contributor: Option<Address>,
     /// The addresses whose approvals count towards `threshold`.
@@ -47,6 +53,14 @@ pub struct Bounty {
     pub deadline: u64,
     /// Current phase.
     pub status: BountyStatus,
+}
+
+/// Seller and payment tranches for a milestone-based escrow.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilestoneSchedule {
+    pub seller: Address,
+    pub amounts: Vec<i128>,
 }
 
 /// A bounty was funded and its escrow opened.
@@ -135,6 +149,14 @@ fn has_reviewer(reviewers: &Vec<Address>, candidate: &Address) -> bool {
     reviewers.iter().any(|reviewer| reviewer == *candidate)
 }
 
+fn released_amount(bounty: &Bounty) -> i128 {
+    let mut released = 0i128;
+    for index in 0..bounty.milestones_paid {
+        released += bounty.milestones.get(index).unwrap();
+    }
+    released
+}
+
 /// A bounty board whose escrow is the contract's own token balance.
 ///
 /// A creator funds a task, a contributor claims it, and a quorum of named
@@ -190,6 +212,9 @@ impl BountyEscrowContract {
             creator: creator.clone(),
             token: token.clone(),
             amount,
+            seller: None,
+            milestones: Vec::from_array(&env, [amount]),
+            milestones_paid: 0,
             contributor: None,
             reviewers: reviewers.clone(),
             approvals: Vec::new(&env),
@@ -220,6 +245,46 @@ impl BountyEscrowContract {
         id
     }
 
+    /// Opens an escrow with an explicit milestone payment schedule. The buyer
+    /// deposits the sum up front; each tranche needs the configured reviewer
+    /// quorum before it is paid to the seller.
+    pub fn create_milestones(
+        env: Env,
+        creator: Address,
+        token: Address,
+        schedule: MilestoneSchedule,
+        reviewers: Vec<Address>,
+        threshold: u32,
+        deadline: u64,
+    ) -> u64 {
+        assert!(
+            !schedule.amounts.is_empty(),
+            "at least one milestone is required"
+        );
+        let mut amount = 0i128;
+        for tranche in schedule.amounts.iter() {
+            assert!(tranche > 0, "milestone amounts must be positive");
+            amount = amount
+                .checked_add(tranche)
+                .expect("milestone total overflow");
+        }
+
+        let id = Self::create(
+            env.clone(),
+            creator,
+            token,
+            amount,
+            reviewers,
+            threshold,
+            deadline,
+        );
+        let mut bounty = read_bounty(&env, id);
+        bounty.seller = Some(schedule.seller);
+        bounty.milestones = schedule.amounts;
+        store_bounty(&env, id, &bounty);
+        id
+    }
+
     /// Records `contributor` as the worker for an open bounty.
     ///
     /// Submission is refused once the deadline has passed, so a dead bounty
@@ -235,6 +300,13 @@ impl BountyEscrowContract {
         assert!(
             env.ledger().timestamp() < bounty.deadline,
             "bounty deadline has passed"
+        );
+        assert!(
+            bounty
+                .seller
+                .as_ref()
+                .is_none_or(|seller| seller == &contributor),
+            "address is not the designated seller"
         );
 
         bounty.contributor = Some(contributor.clone());
@@ -275,9 +347,21 @@ impl BountyEscrowContract {
         let approvals = bounty.approvals.len();
         let reached = approvals >= bounty.threshold;
 
-        if reached {
-            bounty.status = BountyStatus::Released;
-        }
+        let tranche = if reached {
+            let amount = bounty
+                .milestones
+                .get(bounty.milestones_paid)
+                .expect("milestone schedule exhausted");
+            bounty.milestones_paid += 1;
+            if bounty.milestones_paid == bounty.milestones.len() {
+                bounty.status = BountyStatus::Released;
+            } else {
+                bounty.approvals = Vec::new(&env);
+            }
+            Some(amount)
+        } else {
+            None
+        };
         store_bounty(&env, id, &bounty);
 
         ReviewApproved {
@@ -288,8 +372,8 @@ impl BountyEscrowContract {
         }
         .publish(&env);
 
-        if reached {
-            Self::pay(&env, id, &bounty);
+        if let Some(amount) = tranche {
+            Self::pay(&env, id, &bounty, amount);
         }
     }
 
@@ -313,16 +397,17 @@ impl BountyEscrowContract {
         bounty.status = BountyStatus::Refunded;
         store_bounty(&env, id, &bounty);
 
+        let amount = bounty.amount - released_amount(&bounty);
         token::Client::new(&env, &bounty.token).transfer(
             &env.current_contract_address(),
             &bounty.creator,
-            &bounty.amount,
+            &amount,
         );
 
         BountyRefunded {
             id,
             creator: bounty.creator,
-            amount: bounty.amount,
+            amount,
         }
         .publish(&env);
     }
@@ -367,10 +452,11 @@ impl BountyEscrowContract {
         } else {
             bounty.creator.clone()
         };
+        let amount = bounty.amount - released_amount(&bounty);
         token::Client::new(&env, &bounty.token).transfer(
             &env.current_contract_address(),
             &recipient,
-            &bounty.amount,
+            &amount,
         );
     }
 
@@ -409,7 +495,7 @@ impl BountyEscrowContract {
     /// The caller has already stored `Released`, so a re-entrant token could
     /// not be paid twice even if it called back: `approve` and `refund` both
     /// reject a settled bounty.
-    fn pay(env: &Env, id: u64, bounty: &Bounty) {
+    fn pay(env: &Env, id: u64, bounty: &Bounty, amount: i128) {
         let contributor = bounty
             .contributor
             .clone()
@@ -418,13 +504,13 @@ impl BountyEscrowContract {
         token::Client::new(env, &bounty.token).transfer(
             &env.current_contract_address(),
             &contributor,
-            &bounty.amount,
+            &amount,
         );
 
         BountyReleased {
             id,
             contributor,
-            amount: bounty.amount,
+            amount,
         }
         .publish(env);
     }

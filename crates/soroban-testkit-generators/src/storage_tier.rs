@@ -485,9 +485,15 @@ mod tests {
             }
 
             // Verify retrieval per tier
-            for (idx, (key, tier)) in allocations.entries.iter().enumerate() {
+            for (key, tier) in &allocations.entries {
                 let found = cache.get(key, *tier);
-                assert_eq!(found, Some(val_seed + idx as u64));
+                // A generated allocation may reuse a key in the same tier;
+                // the mock cache intentionally follows map last-write-wins
+                // behavior, so compare with the latest matching allocation.
+                let latest = allocations.entries.iter().enumerate().rev()
+                    .find(|(_, (candidate, candidate_tier))| candidate == key && candidate_tier == tier)
+                    .map(|(latest_idx, _)| val_seed + latest_idx as u64);
+                assert_eq!(found, latest);
             }
 
             // Purge temporary tier: temporary keys gone, instance and persistent intact

@@ -432,3 +432,78 @@ fn another_reviewer_cannot_resolve_a_dispute() {
     client.raise_dispute(&id, ctx.user(1));
     client.resolve_dispute(&id, ctx.user(3), &true);
 }
+
+#[test]
+fn each_milestone_requires_its_own_approval_quorum() {
+    let ctx = TestContextBuilder::new().with_users(5).build();
+    let (_, token, client) = deploy(&ctx);
+    let mut milestones = Vec::new(&ctx.env);
+    milestones.push_back(40);
+    milestones.push_back(60);
+    let deadline = ctx.timestamp() + 86_400;
+    let id = client.create_milestones(
+        ctx.user(0),
+        &token,
+        &soroban_testkit_example_escrow::MilestoneSchedule {
+            seller: ctx.user(1).clone(),
+            amounts: milestones,
+        },
+        &reviewer_list(&ctx),
+        &2,
+        &deadline,
+    );
+    client.submit(&id, ctx.user(1));
+    client.approve(&id, ctx.user(2));
+    client.approve(&id, ctx.user(3));
+    assert_eq!(client.status(&id), BountyStatus::Submitted);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&ctx.env, &token).balance(ctx.user(1)),
+        40
+    );
+    assert_eq!(
+        soroban_sdk::token::Client::new(&ctx.env, &token).balance(&client.address),
+        60
+    );
+
+    client.approve(&id, ctx.user(2));
+    client.approve(&id, ctx.user(3));
+    assert_eq!(client.status(&id), BountyStatus::Released);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&ctx.env, &token).balance(ctx.user(1)),
+        100
+    );
+}
+
+#[test]
+fn timeout_refunds_only_milestones_not_yet_paid() {
+    let ctx = TestContextBuilder::new().with_users(5).build();
+    let (_, token, client) = deploy(&ctx);
+    let mut milestones = Vec::new(&ctx.env);
+    milestones.push_back(40);
+    milestones.push_back(60);
+    let deadline = ctx.timestamp() + 100;
+    let id = client.create_milestones(
+        ctx.user(0),
+        &token,
+        &soroban_testkit_example_escrow::MilestoneSchedule {
+            seller: ctx.user(1).clone(),
+            amounts: milestones,
+        },
+        &reviewer_list(&ctx),
+        &2,
+        &deadline,
+    );
+    client.submit(&id, ctx.user(1));
+    client.approve(&id, ctx.user(2));
+    client.approve(&id, ctx.user(3));
+    ctx.env.ledger().set_timestamp(deadline);
+    client.refund(&id);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&ctx.env, &token).balance(ctx.user(0)),
+        9_960
+    );
+    assert_eq!(
+        soroban_sdk::token::Client::new(&ctx.env, &token).balance(ctx.user(1)),
+        40
+    );
+}

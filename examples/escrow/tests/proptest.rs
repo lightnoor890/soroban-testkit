@@ -329,12 +329,28 @@ proptest! {
     #[test]
     fn an_unlisted_third_party_cannot_approve_or_claim_escrowed_funds(amount in 1i128..=1_000_000) {
         let f = setup(amount, 2);
-        let id = f.open(amount, 2);
-        f.client().submit(&id, &f.contributor);
+        let client = f.client();
+        let mut milestones = Vec::new(&f.env);
+        milestones.push_back(amount);
+        let id = client.create_milestones(
+            &f.creator,
+            &f.token,
+            &soroban_testkit_example_escrow::MilestoneSchedule {
+                seller: f.contributor.clone(),
+                amounts: milestones,
+            },
+            &f.reviewers,
+            &2,
+            &f.deadline(),
+        );
         let outsider = Address::generate(&f.env);
-        let result = f.client().try_approve(&id, &outsider);
+        let result = client.try_submit(&id, &outsider);
         prop_assert!(result.is_err());
         prop_assert_eq!(f.escrow(), amount);
         prop_assert_eq!(f.token_client().balance(&outsider), 0);
+        client.submit(&id, &f.contributor);
+        let unauthorized_approval = client.try_approve(&id, &outsider);
+        prop_assert!(unauthorized_approval.is_err());
+        prop_assert_eq!(f.escrow(), amount);
     }
 }
